@@ -8,6 +8,7 @@ require (
 	github.com/containerd/cgroups v0.0.0-20191011165608-5fbad35c2a7e
 	github.com/go-ole/go-ole v1.2.5 // indirect
 	github.com/howeyc/gopass v0.0.0-20190910152052-7cb4b85ec19c
+	github.com/kinwe/kinwe-cpu-percent v0.0.0-20210411105129-02215e5ea410
 	github.com/opencontainers/runtime-spec v1.0.2-0.20190716192640-c9a5f6194441
 	github.com/shirou/gopsutil v2.20.5+incompatible
 	github.com/sirupsen/logrus v1.5.0

@@ -20,6 +20,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	cpu_percent "github.com/kinwe/kinwe-cpu-percent"
+	"github.com/shirou/gopsutil/cpu"
+	"log"
 	"os"
 	"path"
 	"runtime"
@@ -28,9 +31,7 @@ import (
 	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/process"
 
 	"github.com/chaosblade-io/chaosblade-exec-os/exec"
@@ -40,12 +41,26 @@ import (
 )
 
 var (
-	burnCpuStart, burnCpuStop, burnCpuNohup bool
-	cpuCount, cpuPercent, climbTime         int
-	slopePercent                            float64
-	cpuList                                 string
-	cpuProcessor                            string
+	burnCpuStart, burnCpuStop, burnCpuNohup, absolute bool
+	cpuCount, cpuPercent, climbTime                   int
+	slopePercent                                      float64
+	cpuList                                           string
+	cpuProcessor                                      string
 )
+
+var logger *log.Logger
+
+func init() {
+
+	file, err := os.Create("burnCpu.log")
+	if err != nil {
+		log.Fatalln("fail to create test.log file!")
+	}
+	logger = log.New(file, "", log.Llongfile)
+	logger.SetFlags(log.LstdFlags)
+}
+
+var burnCpu func()
 
 func main() {
 	flag.BoolVar(&burnCpuStart, "start", false, "start burn cpu")
@@ -53,13 +68,20 @@ func main() {
 	flag.StringVar(&cpuList, "cpu-list", "", "CPUs in which to allow burning (1,3)")
 	flag.BoolVar(&burnCpuNohup, "nohup", false, "nohup to run burn cpu")
 	flag.IntVar(&climbTime, "climb-time", 0, "durations(s) to climb")
-	flag.IntVar(&cpuCount, "cpu-count", runtime.NumCPU(), "number of cpus")
+	flag.IntVar(&cpuCount, "cpu-count", cpu_percent.CPUNum(), "number of cpus")
 	flag.IntVar(&cpuPercent, "cpu-percent", 100, "percent of burn-cpu")
 	flag.StringVar(&cpuProcessor, "cpu-processor", "0", "only used for identifying process of cpu burn")
-	bin.ParseFlagAndInitLog()
+	flag.BoolVar(&absolute, "absolute", false, "run burn cpu absolute")
 
-	if cpuCount <= 0 || cpuCount > runtime.NumCPU() {
-		cpuCount = runtime.NumCPU()
+	bin.ParseFlagAndInitLog()
+	if cpuCount <= 0 || cpuCount > cpu_percent.CPUNum() {
+		cpuCount = cpu_percent.CPUNum()
+	}
+
+	if absolute {
+		burnCpu = burnCpuOn
+	} else {
+		burnCpu = burnCpuIn
 	}
 
 	if burnCpuStart {
@@ -75,16 +97,21 @@ func main() {
 	}
 }
 
-func burnCpu() {
-
+func burnCpuIn() {
 	runtime.GOMAXPROCS(cpuCount)
-
 	var totalCpuPercent []float64
 	var curProcess *process.Process
 	var curCpuPercent float64
 	var err error
 
-	totalCpuPercent, err = cpu.Percent(time.Second, false)
+	var percent func() ([]float64, error)
+
+	percent = func() ([]float64, error) {
+		return cpu_percent.Percent(time.Second)
+	}
+
+	totalCpuPercent, err = percent()
+
 	if err != nil {
 		bin.PrintErrAndExit(err.Error())
 	}
@@ -101,12 +128,12 @@ func burnCpu() {
 
 	otherCpuPercent := (100.0 - (totalCpuPercent[0] - curCpuPercent)) / 100.0
 	go func() {
-		t := time.NewTicker(3 * time.Second)
+		t := time.NewTicker(2 * time.Second)
 		for {
 			select {
 			// timer 3s
 			case <-t.C:
-				totalCpuPercent, err = cpu.Percent(time.Second, false)
+				totalCpuPercent, err = percent()
 				if err != nil {
 					bin.PrintErrAndExit(err.Error())
 				}
@@ -187,22 +214,27 @@ func startBurnCpu() {
 		cpuCount = 1
 		cores := strings.Split(cpuList, ",")
 		for _, core := range cores {
-			pid := runBurnCpuFunc(ctx, cpuCount, cpuPercent, true, core, climbTime)
+			pid := runBurnCpuFunc(ctx, cpuCount, cpuPercent, true, core, climbTime, absolute)
 			bindBurnCpuFunc(ctx, core, pid)
 		}
 	} else {
-		runBurnCpuFunc(ctx, cpuCount, cpuPercent, false, "", climbTime)
+		runBurnCpuFunc(ctx, cpuCount, cpuPercent, false, "", climbTime, absolute)
 	}
 	checkBurnCpuFunc(ctx)
 }
 
 // runBurnCpu
-func runBurnCpu(ctx context.Context, cpuCount int, cpuPercent int, pidNeeded bool, processor string, climbTime int) int {
-	args := fmt.Sprintf(`%s --nohup --cpu-count %d --cpu-percent %d --climb-time %d`,
-		path.Join(util.GetProgramPath(), burnCpuBin), cpuCount, cpuPercent, climbTime)
+func runBurnCpu(ctx context.Context, cpuCount int, cpuPercent int, pidNeeded bool, processor string, climbTime int, absolute bool) int {
+	args := fmt.Sprintf(`%s --nohup --cpu-percent %d --climb-time %d`,
+		path.Join(util.GetProgramPath(), burnCpuBin), cpuPercent, climbTime)
 	if pidNeeded {
 		args = fmt.Sprintf("%s --cpu-processor %s", args, processor)
 	}
+	if absolute {
+		args = fmt.Sprintf("%s --absolute", args)
+	}
+	args = fmt.Sprintf("%s --cpu-count %d", args, cpuCount)
+
 	args = fmt.Sprintf(`%s > /dev/null 2>&1 &`, args)
 	response := cl.Run(ctx, "nohup", args)
 	if !response.Success {
@@ -232,9 +264,6 @@ func runBurnCpu(ctx context.Context, cpuCount int, cpuPercent int, pidNeeded boo
 
 // bindBurnCpu by taskset command
 func bindBurnCpuByTaskset(ctx context.Context, core string, pid int) {
-	if !cl.IsCommandAvailable("taskset") {
-		bin.PrintErrAndExit(spec.ResponseErr[spec.CommandTasksetNotFound].Err)
-	}
 	response := cl.Run(ctx, "taskset", fmt.Sprintf("-a -cp %s %d", core, pid))
 	if !response.Success {
 		stopBurnCpuFunc()
@@ -266,4 +295,98 @@ func stopBurnCpu() (success bool, errs string) {
 		return false, response.Err
 	}
 	return true, errs
+}
+
+func burnCpuOn() {
+
+	runtime.GOMAXPROCS(cpuCount)
+	var totalCpuPercent []float64
+	var curProcess *process.Process
+	var curCpuPercent float64
+	var err error
+
+	totalCpuPercent, err = cpu.Percent(time.Second, false)
+	if err != nil {
+		bin.PrintErrAndExit(err.Error())
+	}
+
+	curProcess, err = process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		bin.PrintErrAndExit(err.Error())
+	}
+
+	curCpuPercent, err = curProcess.CPUPercent()
+	if err != nil {
+		bin.PrintErrAndExit(err.Error())
+	}
+
+	otherCpuPercent := (100.0 - (totalCpuPercent[0] - curCpuPercent)) / 100.0
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		for {
+			select {
+			// timer 3s
+			case <-t.C:
+				totalCpuPercent, err = cpu.Percent(time.Second, false)
+				if err != nil {
+					bin.PrintErrAndExit(err.Error())
+				}
+				curCpuPercent, err = curProcess.CPUPercent()
+				if err != nil {
+					bin.PrintErrAndExit(err.Error())
+				}
+				otherCpuPercent = (100.0 - (totalCpuPercent[0] - curCpuPercent)) / 100.0
+			}
+		}
+	}()
+
+	if climbTime == 0 {
+		slopePercent = float64(cpuPercent)
+	} else {
+		var ticker *time.Ticker = time.NewTicker(1 * time.Second)
+		slopePercent = totalCpuPercent[0]
+		var startPercent = float64(cpuPercent) - slopePercent
+		go func() {
+			for range ticker.C {
+				if slopePercent < float64(cpuPercent) {
+					slopePercent += startPercent / float64(climbTime)
+				} else if slopePercent > float64(cpuPercent) {
+					slopePercent -= startPercent / float64(climbTime)
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < cpuCount; i++ {
+		go func() {
+			busy := int64(0)
+			idle := int64(0)
+			all := int64(10000000)
+			dx := 0.0
+			ds := time.Duration(0)
+			for i := 0; ; i = (i + 1) % 1000 {
+				startTime := time.Now().UnixNano()
+				if i == 0 {
+					dx = (slopePercent - (curCpuPercent / float64(cpuCount))) / otherCpuPercent
+
+					busy = busy + int64(dx*100000)
+
+					if busy < 0 {
+						busy = 0
+					}
+					idle = all - busy
+
+					if idle < 0 {
+						idle = 0
+					}
+					ds, _ = time.ParseDuration(strconv.FormatInt(idle, 10) + "ns")
+				}
+				for time.Now().UnixNano()-startTime < busy {
+				}
+				time.Sleep(ds)
+				runtime.Gosched()
+			}
+		}()
+	}
+	select {}
 }

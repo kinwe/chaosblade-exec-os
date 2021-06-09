@@ -87,6 +87,11 @@ blade create cpu load --cpu-percent 60`,
 					Desc:     "durations(s) to climb",
 					Required: false,
 				},
+				&spec.ExpFlag{
+					Name:     "absolute",
+					Desc:     "burnCpu absolute",
+					Required: false,
+				},
 			},
 		},
 	}
@@ -158,6 +163,7 @@ func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *spec.ExpMode
 	var cpuList string
 	var cpuPercent int
 	var climbTime int
+	var absolute bool
 
 	cpuPercentStr := model.ActionFlags["cpu-percent"]
 	if cpuPercentStr != "" {
@@ -206,6 +212,16 @@ func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *spec.ExpMode
 			cpuCount = runtime.NumCPU()
 		}
 	}
+	absolutestr := model.ActionFlags["absolute"]
+	if absolutestr != "" {
+		var err error
+		absolute, err = strconv.ParseBool(absolutestr)
+		if err != nil {
+			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf("`%s`: absolute is Bool", absolute))
+			return spec.ResponseFailWaitResult(spec.ParameterIllegal, fmt.Sprintf(spec.ResponseErr[spec.ParameterIllegal].Err, "climb-time"),
+				fmt.Sprintf(spec.ResponseErr[spec.ParameterIllegal].ErrInfo, "absolute"))
+		}
+	}
 
 	climbTimeStr := model.ActionFlags["climb-time"]
 	if climbTimeStr != "" {
@@ -223,15 +239,19 @@ func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *spec.ExpMode
 		}
 	}
 
-	return ce.start(ctx, cpuList, cpuCount, cpuPercent, climbTime)
+	return ce.start(ctx, cpuList, cpuCount, cpuPercent, climbTime, absolute)
 }
 
 // start burn cpu
-func (ce *cpuExecutor) start(ctx context.Context, cpuList string, cpuCount int, cpuPercent int, climbTime int) *spec.Response {
+func (ce *cpuExecutor) start(ctx context.Context, cpuList string, cpuCount int, cpuPercent int, climbTime int, absolute bool) *spec.Response {
 	args := fmt.Sprintf("--start --climb-time %d --cpu-count %d --cpu-percent %d --debug=%t", climbTime, cpuCount, cpuPercent, util.Debug)
 	if cpuList != "" {
 		args = fmt.Sprintf("%s --cpu-list %s", args, cpuList)
 	}
+	if absolute {
+		args = fmt.Sprintf("%s --absolute", args)
+	}
+
 	return ce.channel.Run(ctx, path.Join(ce.channel.GetScriptPath(), BurnCpuBin), args)
 }
 
