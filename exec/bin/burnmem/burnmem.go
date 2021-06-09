@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path"
@@ -32,7 +33,6 @@ import (
 	"github.com/containerd/cgroups"
 	v1 "github.com/containerd/cgroups/stats/v1"
 	"github.com/shirou/gopsutil/mem"
-
 	"github.com/sirupsen/logrus"
 
 	"github.com/chaosblade-io/chaosblade-exec-os/exec"
@@ -44,11 +44,24 @@ const PageCounterMax uint64 = 9223372036854770000
 // 128K
 type Block [32 * 1024]int32
 
+var logger *log.Logger
+
+func init() {
+
+	file, err := os.Create("chaos_mem.log")
+	if err != nil {
+		log.Fatalln("fail to create test.log file!")
+	}
+	logger = log.New(file, "", log.Llongfile)
+	logger.SetFlags(log.LstdFlags)
+}
+
 var (
-	burnMemStart, burnMemStop, burnMemNohup, includeBufferCache bool
-	memPercent, memReserve, memRate                             int
-	burnMemMode                                                 string
+	burnMemStart, burnMemStop, burnMemNohup, includeBufferCache, isHost bool
+	memPercent, memReserve, memRate                                     int
+	burnMemMode                                                         string
 )
+var calculateMemSize func(int, int) (int64, int64, error)
 
 func main() {
 	flag.BoolVar(&burnMemStart, "start", false, "start burn memory")
@@ -59,7 +72,14 @@ func main() {
 	flag.IntVar(&memReserve, "reserve", 0, "reserve to burn memory, unit is M")
 	flag.IntVar(&memRate, "rate", 100, "burn memory rate, unit is M/S, only support for ram mode")
 	flag.StringVar(&burnMemMode, "mode", "cache", "burn memory mode, cache or ram")
+	flag.BoolVar(&isHost, "isHost", false, "run burn mem isHost")
 	bin.ParseFlagAndInitLog()
+
+	if isHost {
+		calculateMemSize = calculateMemSizeFromHost
+	} else {
+		calculateMemSize = calculateMemSizeFromCont
+	}
 
 	if burnMemStart {
 		startBurnMem()
@@ -160,10 +180,6 @@ var runBurnMemFunc = runBurnMem
 func startBurnMem() {
 	ctx := context.Background()
 	if burnMemMode == "cache" {
-		if !cl.IsCommandAvailable("mount") {
-			bin.PrintErrAndExit(spec.ResponseErr[spec.CommandMountNotFound].Err)
-		}
-
 		flPath := path.Join(util.GetProgramPath(), dirName)
 		if _, err := os.Stat(flPath); err != nil {
 			err = os.Mkdir(flPath, os.ModePerm)
@@ -176,13 +192,14 @@ func startBurnMem() {
 			bin.PrintErrAndExit(response.Error())
 		}
 	}
-	runBurnMemFunc(ctx, memPercent, memReserve, memRate, burnMemMode, includeBufferCache)
+	runBurnMemFunc(ctx, memPercent, memReserve, memRate, burnMemMode, includeBufferCache, isHost)
 }
 
-func runBurnMem(ctx context.Context, memPercent, memReserve, memRate int, burnMemMode string, includeBufferCache bool) {
-	args := fmt.Sprintf(`%s --nohup --mem-percent %d --reserve %d --rate %d --mode %s --include-buffer-cache=%t`,
-		path.Join(util.GetProgramPath(), burnMemBin), memPercent, memReserve, memRate, burnMemMode, includeBufferCache)
+func runBurnMem(ctx context.Context, memPercent, memReserve, memRate int, burnMemMode string, includeBufferCache bool, isHost bool) {
+	args := fmt.Sprintf(`%s --nohup --mem-percent %d --reserve %d --rate %d --mode %s --include-buffer-cache=%t --isHost=%t`,
+		path.Join(util.GetProgramPath(), burnMemBin), memPercent, memReserve, memRate, burnMemMode, includeBufferCache, isHost)
 	args = fmt.Sprintf(`%s > /dev/null 2>&1 &`, args)
+
 	response := cl.Run(ctx, "nohup", args)
 	if !response.Success {
 		stopBurnMemFunc()
@@ -217,10 +234,6 @@ func stopBurnMem() (success bool, errs string) {
 	if burnMemMode == "cache" {
 		dirPath := path.Join(util.GetProgramPath(), dirName)
 		if _, err := os.Stat(dirPath); err == nil {
-			if !cl.IsCommandAvailable("umount") {
-				bin.PrintErrAndExit(spec.ResponseErr[spec.CommandUmountNotFound].Err)
-			}
-
 			response = cl.Run(ctx, "umount", dirPath)
 			if !response.Success {
 				if !strings.Contains(response.Err, "not mounted") {
@@ -236,7 +249,10 @@ func stopBurnMem() (success bool, errs string) {
 	return true, errs
 }
 
-func calculateMemSize(percent, reserve int) (int64, int64, error) {
+func calculateMemSizeFromCont(percent, reserve int) (int64, int64, error) {
+
+	logger.Println("进入容器")
+
 	total := int64(0)
 	available := int64(0)
 	memoryStat, err := getMemoryStatsByCGroup()
@@ -267,11 +283,73 @@ func calculateMemSize(percent, reserve int) (int64, int64, error) {
 	} else {
 		reserved = int64(reserve)
 	}
-	expectSize := available/1024/1024 - reserved
+	//container mode mem calculation
+
+	activeAnon := int64(memoryStat.ActiveAnon)
+	inactiveAnon := int64(memoryStat.InactiveAnon)
+	used := int64(activeAnon + inactiveAnon)
+	expectSize := (total*int64(percent)/100 - used) / 1024 / 1024
+	logger.Printf("total: %d, used: %d, percent: %d, expectSize: %d",
+		total/1024/1024, used/1024/1024, percent, expectSize)
 
 	logrus.Debugf("available: %d, percent: %d, reserved: %d, expectSize: %d",
 		available/1024/1024, percent, reserved, expectSize)
 
+	return total / 1024 / 1024, expectSize, nil
+}
+
+func calculateMemSizeFromHost(percent, reserve int) (int64, int64, error) {
+	logger.Println("进入物理机")
+	total := int64(0)
+	available := int64(0)
+	//memoryStat, err := getMemoryStatsByCGroup()
+	var memoryStat *v1.MemoryStat
+
+	//if err != nil {
+	//	logrus.Infof("get memory stats by cgroup failed, used proc memory, %v", err)
+	//}
+	if memoryStat == nil || memoryStat.Usage.Limit >= PageCounterMax {
+		//no limit
+		virtualMemory, err := mem.VirtualMemory()
+		if err != nil {
+			return 0, 0, err
+		}
+		total = int64(virtualMemory.Total)
+		available = int64(virtualMemory.Free)
+		if burnMemMode == "ram" && !includeBufferCache {
+			available = available + int64(virtualMemory.Buffers+virtualMemory.Cached)
+		}
+	} else {
+		total = int64(memoryStat.Usage.Limit)
+		available = total - int64(memoryStat.Usage.Usage)
+		if burnMemMode == "ram" && !includeBufferCache {
+			available = available + int64(memoryStat.Cache)
+		}
+	}
+	reserved := int64(0)
+	if percent != 0 {
+		reserved = (total * int64(100-percent) / 100) / 1024 / 1024
+	} else {
+		reserved = int64(reserve)
+	}
+	//host mode mem calculation
+	virtualMemory, err := mem.VirtualMemory()
+	if err != nil {
+		return 0, 0, err
+	}
+	total = int64(virtualMemory.Total)
+	free := int64(virtualMemory.Free)
+	cached := int64(virtualMemory.Cached)
+	shem := int64(virtualMemory.Shared)
+	used := total - free - cached + shem
+	expectSize := (total*int64(percent)/100 - used) / 1024 / 1024
+	logger.Printf("total: %d, free: %d, cached: %d, shem: %d, used: %d, expectSize: %d",
+		total/1048576, free/1048576, cached/1048576, shem/1048576, used/1048576, expectSize)
+
+	logrus.Debugf("available: %d, percent: %d, reserved: %d, expectSize: %d",
+		available/1024/1024, percent, reserved, expectSize)
+	logger.Printf("available: %d, percent: %d, reserved: %d, expectSize: %d",
+		available/1024/1024, percent, reserved, expectSize)
 	return total / 1024 / 1024, expectSize, nil
 }
 

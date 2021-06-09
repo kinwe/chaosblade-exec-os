@@ -90,6 +90,11 @@ blade create mem load --mode ram --reserve 200 --rate 100`,
 					Desc:   "Ram mode mem-percent is include buffer/cache",
 					NoArgs: true,
 				},
+				&spec.ExpFlag{
+					Name:   "isHost",
+					Desc:   "Ram mode mem-percent is include buffer/cache",
+					NoArgs: true,
+				},
 			},
 		},
 	}
@@ -168,12 +173,14 @@ func (ce *memExecutor) Exec(uid string, ctx context.Context, model *spec.ExpMode
 		return ce.stop(ctx, model.ActionFlags["mode"])
 	}
 	var memPercent, memReserve, memRate int
+	var isHost bool
 
 	memPercentStr := model.ActionFlags["mem-percent"]
 	memReserveStr := model.ActionFlags["reserve"]
 	memRateStr := model.ActionFlags["rate"]
 	burnMemModeStr := model.ActionFlags["mode"]
 	includeBufferCache := model.ActionFlags["include-buffer-cache"] == "true"
+	isHostStr := model.ActionFlags["isHost"]
 
 	var err error
 	if memPercentStr != "" {
@@ -200,6 +207,14 @@ func (ce *memExecutor) Exec(uid string, ctx context.Context, model *spec.ExpMode
 	} else {
 		memPercent = 100
 	}
+	if isHostStr != "" {
+		isHost, err = strconv.ParseBool(isHostStr)
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.IllegalParameters],
+				"--isHost value must be a Bool")
+		}
+	}
+
 	if memRateStr != "" {
 		memRate, err = strconv.Atoi(memRateStr)
 		if err != nil {
@@ -207,17 +222,20 @@ func (ce *memExecutor) Exec(uid string, ctx context.Context, model *spec.ExpMode
 				"--rate value must be a positive integer")
 		}
 	}
-	return ce.start(ctx, memPercent, memReserve, memRate, burnMemModeStr, includeBufferCache)
+	return ce.start(ctx, memPercent, memReserve, memRate, burnMemModeStr, includeBufferCache, isHost)
 }
 
 // start burn mem
-func (ce *memExecutor) start(ctx context.Context, memPercent, memReserve, memRate int, burnMemMode string, includeBufferCache bool) *spec.Response {
+func (ce *memExecutor) start(ctx context.Context, memPercent, memReserve, memRate int, burnMemMode string, includeBufferCache bool, isHost bool) *spec.Response {
 	args := fmt.Sprintf("--start --mem-percent %d --reserve %d --debug=%t", memPercent, memReserve, util.Debug)
 	if memRate != 0 {
 		args = fmt.Sprintf("%s --rate %d", args, memRate)
 	}
 	if burnMemMode != "" {
 		args = fmt.Sprintf("%s --mode %s", args, burnMemMode)
+	}
+	if isHost {
+		args = fmt.Sprintf("%s --isHost", args)
 	}
 	if includeBufferCache {
 		args = fmt.Sprintf("%s --include-buffer-cache=%t", args, includeBufferCache)
